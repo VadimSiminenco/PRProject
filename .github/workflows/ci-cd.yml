@@ -1,0 +1,121 @@
+name: PRProject CI/CD
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-run-test-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build API image
+        run: docker build -f PRProject.Api/Dockerfile -t prproject-api .
+
+      - name: Build Frontend image
+        run: docker build -t prproject-frontend ./front/frontend
+
+      - name: Create Docker network
+        run: docker network create prproject-network
+
+      - name: Run SQL Server container
+        run: |
+          docker run -d --name prproject-db \
+            --network prproject-network \
+            -e ACCEPT_EULA=Y \
+            -e SA_PASSWORD=StrongPass123! \
+            -p 1434:1433 \
+            -v prproject-db-data:/var/opt/mssql \
+            mcr.microsoft.com/mssql/server:2022-latest
+
+      - name: Run GreenMail container
+        run: |
+          docker run -d --name prproject-mail \
+            --network prproject-network \
+            -p 3025:3025 \
+            -p 3110:3110 \
+            -p 3143:3143 \
+            -p 8081:8080 \
+            -e GREENMAIL_OPTS="-Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap -Dgreenmail.setup.test.pop3 -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=user:pass@greenmail.test -Dgreenmail.users.login=email -Dgreenmail.verbose" \
+            greenmail/standalone:2.1.7
+
+      - name: Wait for DB and mail
+        run: sleep 25
+
+      - name: Run API container
+        run: |
+          docker run -d --name prproject-api \
+            --network prproject-network \
+            -p 8080:8080 \
+            -e ConnectionStrings__DefaultConnection="Server=prproject-db,1433;Database=TodoListDb;User Id=sa;Password=StrongPass123!;TrustServerCertificate=True;" \
+            -e MailSettings__SmtpHost="prproject-mail" \
+            -e MailSettings__SmtpPort="3025" \
+            -e MailSettings__ImapHost="prproject-mail" \
+            -e MailSettings__ImapPort="3143" \
+            -e MailSettings__Pop3Host="prproject-mail" \
+            -e MailSettings__Pop3Port="3110" \
+            -e MailSettings__Username="user@greenmail.test" \
+            -e MailSettings__Password="pass" \
+            -e MailSettings__FromEmail="user@greenmail.test" \
+            -e MailSettings__ToEmail="user@greenmail.test" \
+            prproject-api
+
+      - name: Run Frontend container
+        run: |
+          docker run -d --name prproject-frontend \
+            -p 5173:80 \
+            prproject-frontend
+
+      - name: Show running containers
+        run: docker ps
+
+      - name: Wait for API
+        run: |
+          for i in {1..30}; do
+            if curl -f http://localhost:8080/api/tasks; then
+              echo "API is up"
+              exit 0
+            fi
+            echo "Waiting for API..."
+            sleep 10
+          done
+          docker logs prproject-api
+          exit 1
+
+      - name: Check frontend
+        run: curl -f http://localhost:5173
+
+      - name: Check GreenMail
+        run: curl -f http://localhost:8081
+
+      - name: Stop and remove containers
+        if: always()
+        run: |
+          docker stop prproject-frontend prproject-api prproject-mail prproject-db || true
+          docker rm prproject-frontend prproject-api prproject-mail prproject-db || true
+          docker network rm prproject-network || true
+
+      - name: Tag API image
+        run: docker tag prproject-api ${{ secrets.DOCKERHUB_USERNAME }}/prproject-api:latest
+
+      - name: Tag Frontend image
+        run: docker tag prproject-frontend ${{ secrets.DOCKERHUB_USERNAME }}/prproject-frontend:latest
+
+      - name: Push API image
+        run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/prproject-api:latest
+
+      - name: Push Frontend image
+        run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/prproject-frontend:latest
